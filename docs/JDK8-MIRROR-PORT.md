@@ -230,3 +230,11 @@ strings libjvm.dylib | grep -c MirrorMappedCodeCache   # 非 0
 * `patches/jdk8u_ios_mirror_mapping.diff` —— 本补丁
 * `buildjdk.sh` —— 在 `jdk8u_ios_chunk_mmap.diff` 之后应用
 * 参考：`https://github.com/herbrine8403/OpenJDK-iOS-FullVersion/blob/buildjre17-21/patches/jre_17/ios/2_mirror_mapping.diff`
+
+## 10. 后续：RX 翻转补丁（`jdk8u_ios_rx_toggle.diff`）
+
+本文 §8.2 说的「SIGBUS 翻转被禁用、遗漏的写会以确定性 SIGBUS 暴露」已由
+`patches/jdk8u_ios_rx_toggle.diff` 处理：镜像模式下重新接上逐页 RX<->RW 翻转
+（`a2_rx_make_writable` / `a2_rx_restore`，safepoint 回收），并把 `mirror_w/mirror_x`
+的翻译基准从 `CodeCache::low_bound()` 改成实际记录的 RX 基址。
+方案取舍、影响面、真机判据见 `docs/JDK8-RX-TOGGLE.md`。

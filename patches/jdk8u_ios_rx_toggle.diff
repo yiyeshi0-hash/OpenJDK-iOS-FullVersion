@@ -1,0 +1,527 @@
+diff --git a/hotspot/src/os/bsd/vm/os_bsd.cpp b/hotspot/src/os/bsd/vm/os_bsd.cpp
+index 7ac8236..473552f 100644
+--- a/hotspot/src/os/bsd/vm/os_bsd.cpp
++++ b/hotspot/src/os/bsd/vm/os_bsd.cpp
+@@ -115,6 +115,7 @@
+ // Air2 (JIT26) mirror-mapped code cache
+ # include <dirent.h>
+ # include <limits.h>
++# include <stdlib.h>   // ::malloc for the RX page state table
+ #endif
+ 
+ #ifdef __APPLE__
+@@ -166,6 +167,293 @@ int os::Bsd::_page_size = -1;
+ ////////////////////////////////////////////////////////////////////////////////
+ address os::Bsd::debug_jit_mapping_mirrored = NULL;
+ 
++////////////////////////////////////////////////////////////////////////////////
++// Air2 (JIT26) RX toggle
++//
++// Everything that writes into the code cache through mirror_w() lands in the RW
++// alias, which needs no page protection games.  But some jdk8 paths write into
++// code cache pages with a plain store (CodeHeap/CodeBlob bookkeeping, the
++// occasional direct field patch), and those hit pages that are PROT_READ|
++// PROT_EXEC in the alias the CPU executes from.
++//
++// Those stores must not be redirected to the RW alias: on XNU a second mapping
++// that is made writable while its twin stays executable may be turned into a
++// private copy-on-write mapping, in which case a store through the RW alias is
++// simply not visible through the RX alias - the reader then sees a stale block
++// header and the CodeHeap free list silently stops working (device symptom:
++// "used=11MB, free=152MB, not enough contiguous free space left").
++//
++// So the store is performed on the page the reader will look at: the page is
++// switched to writable, the faulting store is retried by the kernel on return
++// from the signal handler, and the page is switched back to RX at the next
++// safepoint (or as soon as somebody asks for the executable alias again).
++// RWX is tried first so that a writable page never loses PROT_EXEC; only when
++// iOS refuses the W+X page (the usual case on hardened devices) do we fall back
++// to RW, in which case the instruction fetch fault path below puts EXEC back.
++////////////////////////////////////////////////////////////////////////////////
++address os::Bsd::debug_jit_rx_base = NULL;
++size_t  os::Bsd::debug_jit_rx_size = 0;
++
++enum {
++  A2_RX_PAGE_RX  = 0,   // PROT_READ|PROT_EXEC      (steady state)
++  A2_RX_PAGE_RW  = 1,   // PROT_READ|PROT_WRITE     (exec dropped, must restore)
++  A2_RX_PAGE_RWX = 2    // PROT_READ|PROT_WRITE|PROT_EXEC
++};
++
++static address      a2_rx_window_base = NULL;    // RX alias base (recorded)
++static size_t       a2_rx_window_size = 0;
++static size_t       a2_rx_page_size   = 0;
++static unsigned char* a2_rx_page_state = NULL;   // one byte per page
++static size_t       a2_rx_page_count  = 0;
++static volatile int a2_rx_dirty_pages = 0;
++static volatile long a2_rx_fault_count = 0;
++static volatile long a2_rx_flip_count  = 0;
++static volatile long a2_rx_fail_count  = 0;
++static bool         a2_rx_lock_ready  = false;
++static pthread_mutex_t a2_rx_lock;
++
++// Hard stop so that a genuine wild store into the code cache window still ends
++// up in the normal crash handler instead of being papered over for ever.
++#define A2_RX_MAX_FLIPS 8192
++
++static bool a2_rx_enabled() {
++  return os::Bsd::debug_jit_mapping_mirrored != NULL &&
++         a2_rx_window_base != NULL && a2_rx_page_count != 0;
++}
++
++static size_t a2_rx_page_align_down(address addr) {
++  return (size_t)addr & ~(a2_rx_page_size - 1);
++}
++
++// Clamp [addr, addr+len) to whole pages inside the mirrored window.
++static bool a2_rx_page_range(address addr, size_t len, address* beg, address* end) {
++  if (a2_rx_page_size == 0 || a2_rx_window_base == NULL) return false;
++  if (len == 0) len = 1;
++  address win_lo = a2_rx_window_base;
++  address win_hi = a2_rx_window_base + a2_rx_window_size;
++  size_t lo = a2_rx_page_align_down(addr);
++  size_t hi = a2_rx_page_align_down(addr + len - 1) + a2_rx_page_size;
++  if (lo < (size_t)win_lo) lo = (size_t)win_lo;
++  if (hi > (size_t)win_hi) hi = (size_t)win_hi;
++  if (hi <= lo) return false;
++  *beg = (address)lo;
++  *end = (address)hi;
++  return true;
++}
++
++// Called from get_debug_jit_mapping() once the RX/RW pair exists.
++static void a2_rx_init_window(address rx_base, size_t size) {
++  if (rx_base == NULL || size == 0) return;
++
++  long ps = ::sysconf(_SC_PAGESIZE);
++  if (ps <= 0) ps = 16384;              // arm64 iOS/macOS default
++  a2_rx_page_size = (size_t)ps;
++
++  if (a2_rx_window_base != NULL && a2_rx_window_base != rx_base) {
++    // Only one mirrored code cache is expected (one CodeHeap).  A second one
++    // means the single global pair in os_bsd.hpp is being reused, which makes
++    // mirror_w()/mirror_x() translate to the wrong alias - worth knowing.
++    printf("[JIT26] WARNING: second mirrored mapping (was %p, now %p)\n",
++           (void*)a2_rx_window_base, (void*)rx_base);
++    if (a2_rx_page_state != NULL) ::free(a2_rx_page_state);
++    a2_rx_page_state = NULL;
++    a2_rx_page_count = 0;
++    a2_rx_dirty_pages = 0;
++  }
++
++  size_t pages = (size + a2_rx_page_size - 1) / a2_rx_page_size;
++  unsigned char* state = (unsigned char*)::malloc(pages);
++  if (state == NULL) {
++    printf("[JIT26] RX toggle: cannot track %lu pages, staying inert\n", (unsigned long)pages);
++    return;
++  }
++  memset(state, A2_RX_PAGE_RX, pages);
++
++  if (!a2_rx_lock_ready) {
++    pthread_mutexattr_t attr;
++    if (pthread_mutexattr_init(&attr) == 0) {
++      // Recursive so that a nested a2_rx_make_writable() call inside the same
++      // thread (signal handler interrupting a flipper) cannot deadlock.
++      pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
++      if (pthread_mutex_init(&a2_rx_lock, &attr) != 0) {
++        pthread_mutex_init(&a2_rx_lock, NULL);
++      }
++      pthread_mutexattr_destroy(&attr);
++    } else {
++      pthread_mutex_init(&a2_rx_lock, NULL);
++    }
++    a2_rx_lock_ready = true;
++  }
++
++  a2_rx_page_state = state;
++  a2_rx_page_count = pages;
++  a2_rx_window_base = rx_base;
++  a2_rx_window_size = size;
++  os::Bsd::debug_jit_rx_base = rx_base;
++  os::Bsd::debug_jit_rx_size = size;
++
++  printf("[JIT26] RX toggle armed: base=%p size=%luMB page=%luKB\n",
++         (void*)rx_base, (unsigned long)(size / (1024 * 1024)),
++         (unsigned long)(a2_rx_page_size / 1024));
++}
++
++bool os::Bsd::a2_rx_contains(address addr) {
++  return a2_rx_window_base != NULL &&
++         addr >= a2_rx_window_base &&
++         addr <  a2_rx_window_base + a2_rx_window_size;
++}
++
++// Switch the pages covering [addr, addr+len) to writable.  Returns true when at
++// least one page was (or already is) writable.  Safe to call from a signal
++// handler: takes the lock with trylock, and mprotect() itself is atomic.
++bool os::Bsd::a2_rx_make_writable(address addr, size_t len) {
++  address beg, end;
++  if (!a2_rx_enabled()) return false;
++  if (!a2_rx_page_range(addr, len, &beg, &end)) return false;
++
++  bool locked = a2_rx_lock_ready && (pthread_mutex_trylock(&a2_rx_lock) == 0);
++  bool ok = false;
++
++  for (address p = beg; p < end; p += a2_rx_page_size) {
++    size_t i = (size_t)(p - a2_rx_window_base) / a2_rx_page_size;
++    if (i >= a2_rx_page_count) break;
++    if (a2_rx_page_state[i] != A2_RX_PAGE_RX) { ok = true; continue; }  // already writable
++
++    if (a2_rx_flip_count >= A2_RX_MAX_FLIPS) {
++      printf("[JIT26] RX toggle: flip limit reached, giving up on %p\n", (void*)p);
++      a2_rx_fail_count++;
++      break;
++    }
++
++    // Prefer RWX: a writable page that keeps PROT_EXEC cannot trap another
++    // thread that happens to be executing code out of the same page.
++    if (::mprotect(p, a2_rx_page_size, PROT_READ | PROT_WRITE | PROT_EXEC) == 0) {
++      a2_rx_page_state[i] = A2_RX_PAGE_RWX;
++    } else if (::mprotect(p, a2_rx_page_size, PROT_READ | PROT_WRITE) == 0) {
++      a2_rx_page_state[i] = A2_RX_PAGE_RW;
++    } else {
++      int err = errno;
++      a2_rx_fail_count++;
++      printf("[JIT26] Failed to make RX region writable: %d (%p)\n", err, (void*)p);
++      continue;
++    }
++    a2_rx_dirty_pages++;
++    a2_rx_flip_count++;
++    ok = true;
++  }
++
++  if (locked) pthread_mutex_unlock(&a2_rx_lock);
++  return ok;
++}
++
++void os::Bsd::a2_rx_restore(address addr, size_t len) {
++  address beg, end;
++  if (!a2_rx_enabled()) return;
++  if (!a2_rx_page_range(addr, len, &beg, &end)) return;
++
++  bool locked = a2_rx_lock_ready && (pthread_mutex_trylock(&a2_rx_lock) == 0);
++
++  for (address p = beg; p < end; p += a2_rx_page_size) {
++    size_t i = (size_t)(p - a2_rx_window_base) / a2_rx_page_size;
++    if (i >= a2_rx_page_count) break;
++    if (a2_rx_page_state[i] == A2_RX_PAGE_RX) continue;
++    if (::mprotect(p, a2_rx_page_size, PROT_READ | PROT_EXEC) == 0) {
++      a2_rx_page_state[i] = A2_RX_PAGE_RX;
++      if (a2_rx_dirty_pages > 0) a2_rx_dirty_pages--;
++    } else {
++      a2_rx_fail_count++;
++      printf("[JIT26] Failed to restore RX protection: %d (%p)\n", errno, (void*)p);
++    }
++  }
++
++  if (locked) pthread_mutex_unlock(&a2_rx_lock);
++}
++
++// Restore every page that was toggled; called at safepoint end, where no thread
++// can be inside a flipped (possibly non-executable) code cache page.
++void os::Bsd::a2_rx_restore_all() {
++  if (!a2_rx_enabled() || a2_rx_dirty_pages == 0) return;
++
++  bool locked = a2_rx_lock_ready && (pthread_mutex_trylock(&a2_rx_lock) == 0);
++  size_t i = 0;
++  while (i < a2_rx_page_count) {
++    if (a2_rx_page_state[i] == A2_RX_PAGE_RX) { i++; continue; }
++    // Coalesce a run of toggled pages into one mprotect.
++    size_t j = i;
++    while (j < a2_rx_page_count && a2_rx_page_state[j] != A2_RX_PAGE_RX) j++;
++    address p = a2_rx_window_base + i * a2_rx_page_size;
++    size_t n  = (j - i) * a2_rx_page_size;
++    if (::mprotect(p, n, PROT_READ | PROT_EXEC) == 0) {
++      memset(a2_rx_page_state + i, A2_RX_PAGE_RX, j - i);
++      a2_rx_dirty_pages -= (int)(j - i);
++      if (a2_rx_dirty_pages < 0) a2_rx_dirty_pages = 0;
++    } else {
++      a2_rx_fail_count++;
++      printf("[JIT26] Failed to restore RX protection: %d (%p, %lu pages)\n",
++             errno, (void*)p, (unsigned long)(j - i));
++    }
++    i = j;
++  }
++  if (locked) pthread_mutex_unlock(&a2_rx_lock);
++}
++
++static address a2_rx_fault_address(siginfo_t* info, void* ucVoid) {
++  if (info != NULL && info->si_addr != NULL) {
++    return (address)info->si_addr;
++  }
++#ifdef __DARWIN_ARM64
++  if (ucVoid != NULL) {
++    ucontext_t* uc = (ucontext_t*)ucVoid;
++    if (uc->uc_mcontext != NULL) {
++      return (address)(uintptr_t)uc->uc_mcontext->__es.__far;
++    }
++  }
++#endif
++  return NULL;
++}
++
++// Returns true when the fault was handled and the faulting instruction should be
++// retried by the kernel (i.e. the signal handler returns "handled").
++bool os::Bsd::a2_rx_handle_fault(int sig, siginfo_t* info, void* ucVoid) {
++  if (!a2_rx_enabled()) return false;
++
++  a2_rx_fault_count++;
++
++  address far = a2_rx_fault_address(info, ucVoid);
++  address pc  = (ucVoid != NULL) ? os::Bsd::ucontext_get_pc((ucontext_t*)ucVoid) : NULL;
++
++  // (a) instruction fetch faulted inside the window: the page lost PROT_EXEC
++  //     (we had to fall back to RW).  Put EXEC back and retry.
++  if (pc != NULL && a2_rx_contains(pc) && (far == NULL || far == pc)) {
++    if (a2_rx_make_writable(pc, 1)) {
++      // make_writable() prefers RWX, which is exactly what the fetch needs.
++      if (a2_rx_fault_count <= 8) {
++        printf("[JIT26] RX toggle: restored exec on fetch fault at %p\n", (void*)pc);
++      }
++      return true;
++    }
++    a2_rx_restore(pc, 1);
++    return true;
++  }
++
++  // (b) data store into a page that is still RX: toggle it and let the store be
++  //     retried.  The page is switched back at the next safepoint.
++  if (far != NULL && a2_rx_contains(far)) {
++    if (a2_rx_make_writable(far, 1)) {
++      if (a2_rx_fault_count <= 8) {
++        printf("[JIT26] RX toggle: write fault at %p made writable (pc=%p)\n",
++               (void*)far, (void*)pc);
++      }
++      return true;
++    }
++    printf("[JIT26] RX toggle: cannot handle write fault at %p, falling through\n", (void*)far);
++    return false;
++  }
++
++  return false;
++}
++
++
+ // Executed as a trap; the debugger intercepts SIGTRAP for brk #0x69, maps a
+ // `bytes` sized RX region and returns its base address in x0.  When no debugger
+ // is attached the trap kills us, which is why we only do this when
+@@ -247,42 +535,110 @@ char* get_debug_jit_mapping(size_t bytes) {
+     printf("[JIT26] mapping at RW=%p, RX=%p\n", (void*)buf_rw, (void*)buf_rx);
+ 
+     os::Bsd::debug_jit_mapping_mirrored = (address)buf_rw;
++
++    // Air2 (JIT26) RX toggle: remember the window we just created and arm the
++    // per page RX<->RW bookkeeping.  Everything that writes into the code cache
++    // without going through mirror_w() is handled from the fault path now.
++    a2_rx_init_window((address)buf_rx, bytes);
++
++    // Does a store through the RW alias become visible through the RX alias?
++    // If XNU turns the writable twin into a private copy-on-write mapping it
++    // does not, and then mirror_w() must not be used for code cache metadata
++    // (-XX:+A2InlineRxWrites).  This probe answers it once per VM start.
++    {
++        volatile unsigned int* rw_probe = (volatile unsigned int*)buf_rw;
++        volatile unsigned int* rx_probe = (volatile unsigned int*)buf_rx;
++        unsigned int saved = *rw_probe;
++        *rw_probe = 0xA2C0DE01u;
++        unsigned int seen = *rx_probe;
++        *rw_probe = saved;
++        if (seen == 0xA2C0DE01u) {
++            printf("[JIT26] alias write-through: OK (RW stores visible through RX)\n");
++        } else {
++            printf("[JIT26] alias write-through: BROKEN (RW stores NOT visible through RX,"
++                   " use -XX:+A2InlineRxWrites)\n");
++        }
++    }
++
+     return (char *)buf_rx;
+ }
+ 
+ // TODO: handle segmented mappings?
+-#define _mirror_rw_to_rx addr + (debug_jit_mapping_mirrored ? (low_bound - debug_jit_mapping_mirrored) : 0)
+-#define _mirror_rx_to_rw addr + (debug_jit_mapping_mirrored ? (debug_jit_mapping_mirrored - low_bound) : 0)
++//
++// Air2 (JIT26) RX toggle: the canonical RX base of the mirrored window is the
++// address get_debug_jit_mapping() got back, *not* CodeCache::low_bound().  The
++// two usually agree, but during CodeHeap::reserve() (where block headers are
++// already being written) CodeCache::low_bound() is still NULL, and if the
++// ReservedSpace alignment logic ever trims the start of the reservation they
++// differ by a constant - in which case every mirror_w() store lands at the wrong
++// offset and the CodeHeap bookkeeping rots silently.  Prefer the recorded base
++// and fall back to CodeCache::low_bound() only for mappings we did not record.
++static address a2_mirror_rx_lo() {
++    if (a2_rx_window_base != NULL) return a2_rx_window_base;
++    return CodeCache::low_bound();
++}
++
++// One-shot diagnostic: the code cache handed to CodeHeap does not start where
++// the JIT26 mapping starts.  Translations are still correct relative to the
++// recorded base, but the window then contains pages nobody owns.
++static void a2_mirror_check_bounds() {
++    static bool warned = false;
++    if (warned || a2_rx_window_base == NULL) return;
++    address low = CodeCache::low_bound();
++    if (low != NULL && low != a2_rx_window_base) {
++        warned = true;
++        printf("[JIT26] WARNING: CodeCache::low_bound=%p != JIT26 RX base=%p (delta=%ld)\n",
++               (void*)low, (void*)a2_rx_window_base,
++               (long)((intptr_t)a2_rx_window_base - (intptr_t)low));
++    }
++}
++
+ address os::Bsd::mirrored_swap_wx(address addr) {
+     if(debug_jit_mapping_mirrored == NULL) return addr;
+-    address low_bound = CodeCache::low_bound();
+-    address high_bound = CodeCache::high_bound();
++    a2_mirror_check_bounds();
++    address low_bound = a2_mirror_rx_lo();
++    address high_bound = low_bound + a2_rx_window_size;
++    if(a2_rx_window_size == 0) high_bound = CodeCache::high_bound();
+     if(addr >= low_bound && addr < high_bound) {
+-        return _mirror_rx_to_rw;
++        return addr + (debug_jit_mapping_mirrored - low_bound);   // RX -> RW
++    } else if (a2_rx_window_size != 0 &&
++               addr >= debug_jit_mapping_mirrored &&
++               addr <  debug_jit_mapping_mirrored + a2_rx_window_size) {
++        return addr + (low_bound - debug_jit_mapping_mirrored);   // RW -> RX
+     } else {
+-        return _mirror_rw_to_rx;
++        return addr;
+     }
+ }
+ // get_debug_jit_mapping returns rx map
+ address os::Bsd::mirrored_find_rw(address addr) {
+     if(!MirrorMappedCodeCache || debug_jit_mapping_mirrored == NULL) return addr;
+-    address low_bound = CodeCache::low_bound();
+-    address high_bound = CodeCache::high_bound();
+-    if(addr >= low_bound && addr < high_bound) {
+-        return _mirror_rx_to_rw;
+-    } else {
+-        return addr;
++    a2_mirror_check_bounds();
++    address low_bound = a2_mirror_rx_lo();
++    address high_bound = low_bound + a2_rx_window_size;
++    if(a2_rx_window_size == 0) high_bound = CodeCache::high_bound();
++
++    // Air2 (JIT26) RX toggle, opt-in: write into the page the reader will look
++    // at instead of the RW alias.  Needed when the write-through probe reports
++    // BROKEN; costs a page state lookup and (once per page) an mprotect.
++    if (addr >= low_bound && addr < high_bound) {
++        if (A2InlineRxWrites && a2_rx_make_writable(addr, 1)) {
++            return addr;
++        }
++        return addr + (debug_jit_mapping_mirrored - low_bound);
+     }
++    return addr;
+ }
+ address os::Bsd::mirrored_find_rx(address addr) {
+     if(!MirrorMappedCodeCache || debug_jit_mapping_mirrored == NULL) return addr;
+-    address low_bound = CodeCache::low_bound();
+-    address high_bound = CodeCache::high_bound();
+-    size_t size = high_bound - low_bound;
++    a2_mirror_check_bounds();
++    address low_bound = a2_mirror_rx_lo();
++    size_t  size = a2_rx_window_size;
++    if (size == 0) size = CodeCache::high_bound() - CodeCache::low_bound();
++    address high_bound = low_bound + size;
+     if(addr >= low_bound && addr < high_bound) {
+         return addr;
+     } else if(addr >= debug_jit_mapping_mirrored && addr < debug_jit_mapping_mirrored + size) {
+-        return _mirror_rw_to_rx;
++        return addr + (low_bound - debug_jit_mapping_mirrored);
+     } else {
+         return addr;
+     }
+diff --git a/hotspot/src/os/bsd/vm/os_bsd.hpp b/hotspot/src/os/bsd/vm/os_bsd.hpp
+index 154904d..a7284f3 100644
+--- a/hotspot/src/os/bsd/vm/os_bsd.hpp
++++ b/hotspot/src/os/bsd/vm/os_bsd.hpp
+@@ -93,6 +93,21 @@ class Bsd {
+   static address mirrored_swap_wx(address addr);
+   static address mirrored_find_rw(address addr);
+   static address mirrored_find_rx(address addr);
++
++  // Air2 (JIT26) RX toggle: the mirrored code cache is executed through the RX
++  // alias, so a page that has to be written while it is PROT_READ|PROT_EXEC can
++  // not simply be written through the RW alias (writes may be invisible through
++  // the exec alias if the kernel turned it into a private copy).  Instead the
++  // page itself is switched to writable for the duration of the write and then
++  // switched back to RX.
++  static address debug_jit_rx_base;   // RX alias base of the mirrored window
++  static size_t  debug_jit_rx_size;   // its length in bytes
++
++  static bool    a2_rx_contains(address addr);
++  static bool    a2_rx_make_writable(address addr, size_t len);
++  static void    a2_rx_restore(address addr, size_t len);
++  static void    a2_rx_restore_all();
++  static bool    a2_rx_handle_fault(int sig, siginfo_t* info, void* ucVoid);
+ #endif
+ 
+   static void init_thread_fpu_state();
+diff --git a/hotspot/src/os_cpu/bsd_aarch64/vm/os_bsd_aarch64.cpp b/hotspot/src/os_cpu/bsd_aarch64/vm/os_bsd_aarch64.cpp
+index 64a4f3d..2925516 100644
+--- a/hotspot/src/os_cpu/bsd_aarch64/vm/os_bsd_aarch64.cpp
++++ b/hotspot/src/os_cpu/bsd_aarch64/vm/os_bsd_aarch64.cpp
+@@ -211,9 +211,28 @@ JVM_handle_bsd_signal(int sig,
+                         int abort_if_unrecognized) {
+   ucontext_t* uc = (ucontext_t*) ucVoid;
+ 
+-  // Air2 (JIT26): with a mirror-mapped code cache W^X is solved by the two
+-  // aliases, there is no per-page RW<->RX toggling left to do here.  Real
+-  // SIGBUSes must fall through to the normal crash handler.
++#ifdef __APPLE__
++  // Air2 (JIT26) RX toggle: with a mirrored code cache, a protection fault can
++  // mean one of two things and both are recoverable:
++  //   - a store into a page that is still PROT_READ|PROT_EXEC in the RX alias
++  //     (CodeHeap/CodeBlob bookkeeping that does not go through mirror_w()):
++  //     the page is switched to writable and the store is retried;
++  //   - an instruction fetch from a page the toggle had to strip EXEC from
++  //     (iOS refuses W+X): EXEC is put back and the fetch is retried.
++  // arm64/iOS raises SIGBUS for protection violations on some paths and SIGSEGV
++  // on others, so both are offered to the toggle.  Anything outside the mirrored
++  // window falls through to the normal handler below.
++  if ((sig == SIGBUS || sig == SIGSEGV) &&
++      os::Bsd::debug_jit_mapping_mirrored != NULL) {
++    if (os::Bsd::a2_rx_handle_fault(sig, info, ucVoid)) {
++      return 1;
++    }
++  }
++#endif
++
++  // Air2 (JIT26): legacy (non mirrored) code cache path - the reserved code
++  // space keeps using these per page RW<->RX flips.  With a mirror-mapped code
++  // cache the RX toggle above handles both directions instead.
+   if (sig == SIGBUS && os::Bsd::debug_jit_mapping_mirrored == NULL) {
+     address addr = os::Bsd::ucontext_get_pc(uc);
+     //address addr = (address) info->si_addr;
+diff --git a/hotspot/src/share/vm/runtime/globals.hpp b/hotspot/src/share/vm/runtime/globals.hpp
+index d09a904..044cc41 100644
+--- a/hotspot/src/share/vm/runtime/globals.hpp
++++ b/hotspot/src/share/vm/runtime/globals.hpp
+@@ -3414,6 +3414,9 @@ class CommandLineFlags {
+   product(bool, MirrorMappedCodeCache, false,                               \
+           "Map the code cache as a RW/RX alias pair (iOS 26 JIT support)")  \
+                                                                             \
++  product(bool, A2InlineRxWrites, false,                                    \
++          "Air2: write the mirrored code cache through the RX alias (per page toggle)") \
++                                                                            \
+   product_pd(uintx, ReservedCodeCacheSize,                                  \
+           "Reserved code cache size (in bytes) - maximum code cache size")  \
+                                                                             \
+diff --git a/hotspot/src/share/vm/runtime/safepoint.cpp b/hotspot/src/share/vm/runtime/safepoint.cpp
+index 36f90e8..9c11d27 100644
+--- a/hotspot/src/share/vm/runtime/safepoint.cpp
++++ b/hotspot/src/share/vm/runtime/safepoint.cpp
+@@ -542,6 +542,13 @@ void SafepointSynchronize::end() {
+   // Remove safepoint check from interpreter
+   Interpreter::ignore_safepoints();
+ 
++#ifdef __APPLE__
++  // Air2 (JIT26) RX toggle: every thread is still parked at the safepoint here,
++  // so no thread can be executing out of a code cache page that the fault
++  // handler had to switch to RW (and thereby lost PROT_EXEC).
++  os::Bsd::a2_rx_restore_all();
++#endif
++
+   {
+     MutexLocker mu(Safepoint_lock);
+ 

@@ -79,6 +79,7 @@ else
   git apply --reject --whitespace=fix ../patches/jdk8u_ios_fix_clang.diff || echo "git apply failed (ios clang fix patch set)"
   git apply --reject --whitespace=fix ../patches/jdk8u_ios_chunk_mmap.diff || echo "git apply failed (air2 chunk mmap patch)"
   git apply --reject --whitespace=fix ../patches/jdk8u_ios_mirror_mapping.diff || echo "git apply failed (air2 mirror mapping patch)"
+  git apply --reject --whitespace=fix ../patches/jdk8u_ios_rx_toggle.diff || echo "git apply failed (air2 rx toggle patch)"
 fi
 
 #   --with-extra-cxxflags="$CXXFLAGS -Dchar16_t=uint16_t -Dchar32_t=uint32_t" \

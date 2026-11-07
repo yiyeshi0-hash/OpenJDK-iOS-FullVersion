@@ -168,9 +168,14 @@ delta 直接给出来：
    翻页会失败 → 日志出 `Failed to make RX region writable`，此时自动退回 RW 别名写。
 5. **11MB 的确切触发点仍是推断**（commit/expand 失败？block header 读到旧值？）。
    补丁加的三条日志就是为了把它钉死，而不是声称已经证明。
-6. 三个旧补丁在**当前** corretto-8 tip 上各有 1 个 hunk reject（`gcc.make` /
-   `dependencies.hpp` / `cpCache.hpp`，`--reject` 后不阻塞热点编译），与本补丁无关，
-   但会一起出现在构建日志里，别误判成本补丁的锅。
+6. 三个旧补丁在**当前** corretto-8 tip 上各有 1 个 hunk reject，与本补丁无关，但会
+   一起出现在构建日志里，别误判成本补丁的锅。逐个核实过：
+   * `dependencies.hpp` / `cpCache.hpp`：上游已改成 `(~0u) << ...`，reject 是**无操作**
+     （补丁想改的东西上游已经改了）。
+   * `hotspot/make/bsd/makefiles/gcc.make`：上游把那段重构成 `MAC_FLAGS = -mmacosx-version-min=...`，
+     所以 iOS 补丁里 `-mmacosx-version-min` → `-miphoneos-version-min` 的交换落不了地。
+     从新 clone 构建时要看眼：需要改成 `MAC_FLAGS = -miphoneos-version-min=$(MACOSX_VERSION_MIN)`
+     （现有构建能过，说明 CFLAGS 实际由 configure/buildjdk.sh 主导，但这个 hunk 是死的）。
 
 ---
 

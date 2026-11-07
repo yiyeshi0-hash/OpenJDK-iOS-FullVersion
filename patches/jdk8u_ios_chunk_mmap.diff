@@ -1,0 +1,53 @@
+diff --git a/hotspot/src/share/vm/memory/allocation.cpp b/hotspot/src/share/vm/memory/allocation.cpp
+--- a/hotspot/src/share/vm/memory/allocation.cpp
++++ b/hotspot/src/share/vm/memory/allocation.cpp
+@@ -35,6 +35,9 @@
+ #include "runtime/threadCritical.hpp"
+ #include "services/memTracker.hpp"
+ #include "utilities/ostream.hpp"
++#ifdef __APPLE__
++# include <sys/mman.h>
++#endif
+ 
+ #ifdef TARGET_OS_FAMILY_linux
+ # include "os_linux.inline.hpp"
+@@ -384,7 +387,22 @@
+    case Chunk::init_size:   return ChunkPool::small_pool()->allocate(bytes, alloc_failmode);
+    case Chunk::tiny_size:   return ChunkPool::tiny_pool()->allocate(bytes, alloc_failmode);
+    default: {
+-     void* p = os::malloc(bytes, mtChunk, CALLER_PC);
++     void* p = NULL;
++#ifdef __APPLE__
++     // Air2 patch: on iOS a large contiguous malloc can fail due to address-space
++     // fragmentation (device hs_err: Chunk::new 67108912). Allocate arena chunks
++     // >= 1MB with mmap, bypassing malloc's contiguous-block limitation.
++     // Free side must mirror this branch (see Chunk::operator delete).
++     if (length >= (size_t)1 * M) {
++       p = ::mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++       if (p == MAP_FAILED) {
++         p = NULL;
++       } else {
++         return p;
++       }
++     }
++#endif
++     p = os::malloc(bytes, mtChunk, CALLER_PC);
+      if (p == NULL && alloc_failmode == AllocFailStrategy::EXIT_OOM) {
+        vm_exit_out_of_memory(bytes, OOM_MALLOC_ERROR, "Chunk::new");
+      }
+@@ -400,7 +418,14 @@
+    case Chunk::medium_size: ChunkPool::medium_pool()->free(c); break;
+    case Chunk::init_size:   ChunkPool::small_pool()->free(c); break;
+    case Chunk::tiny_size:   ChunkPool::tiny_pool()->free(c); break;
+-   default:                 os::free(c, mtChunk);
++   default:
++#ifdef __APPLE__
++     if (c->length() >= (size_t)1 * M) {
++       ::munmap((void*)c, aligned_overhead_size() + c->length());
++       break;
++     }
++#endif
++     os::free(c, mtChunk);
+   }
+ }
+ 

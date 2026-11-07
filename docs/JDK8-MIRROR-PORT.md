@@ -179,8 +179,10 @@ $ echo $?
 0
 ```
 
-> 注：前 4 个补丁本身在最新 corretto-8 上就有 6~8 个 hunk 被 reject（`(-1)` → `(~0u)` 之类的
-> clang 兼容性小改），这是既有状态，与本次镜像补丁无关；本补丁在**这种 reject 后的树**上依然干净应用。
+> 注：前 4 个补丁本身在最新 corretto-8 上就有 8 个 hunk（6 个文件）被 reject（`(-1)` → `(~0u)`
+> 之类的 clang 兼容性小改，见 `common/autoconf/flags.m4`、`hotspot/make/bsd/makefiles/gcc.make`、
+> `hotspot/src/share/vm/code/dependencies.hpp` 等），这是既有状态，与本次镜像补丁无关；
+> 本补丁在**这种 reject 后的树**上依然干净应用（0 reject）。
 
 ### 7.2 二进制里有 JIT26 符号（构建出 libjvm.dylib 之后）
 
